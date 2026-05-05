@@ -9,44 +9,25 @@ from gpu_extras.batch import batch_for_shader
 bl_info = {
     "name": "Scatter Brush",
     "author": "Truong",
-    "version": (1, 5),
+    "version": (1, 6),
     "blender": (5, 1, 1),
     "location": "View3D > Sidebar > Scatter Tab",
-    "description": "Optimized Scatter with Preview and Auto-Merge",
+    "description": "Scatter objects merged with surface and fixed 3D previews",
     "category": "Object",
 }
 
 # --- Properties ---
 class ScatterProperties(bpy.types.PropertyGroup):
-    source_obj: bpy.props.PointerProperty(
-        name="Source Object",
-        type=bpy.types.Object,
-        description="Object to be scattered"
-    )
+    source_obj: bpy.props.PointerProperty(name="Source Object", type=bpy.types.Object)
+    target_surface: bpy.props.PointerProperty(name="Target Surface", type=bpy.types.Object)
+    density: bpy.props.FloatProperty(name="Density", default=0.5, min=0.01)
+    radius: bpy.props.FloatProperty(name="Brush Radius", default=1.0, min=0.0)
+    offset: bpy.props.FloatProperty(name="Surface Offset", default=0.0)
     
-    target_surface: bpy.props.PointerProperty(
-        name="Target Surface",
-        type=bpy.types.Object,
-        description="The plane/object to paint on"
-    )
-    
-    density: bpy.props.FloatProperty(
-        name="Density", default=0.5, min=0.01
-    )
-    
-    radius: bpy.props.FloatProperty(
-        name="Brush Radius", default=1.0, min=0.0
-    )
-    
-    offset: bpy.props.FloatProperty(
-        name="Surface Offset", default=0.0,
-        description="Extra offset from surface base"
-    )
-    
-    auto_join: bpy.props.BoolProperty(
-        name="Merge Results",
+    merge_with_surface: bpy.props.BoolProperty(
+        name="Merge with Surface",
         default=True,
-        description="Merge all scattered objects into one mesh to save performance"
+        description="Merge scattered objects directly into the Target Surface"
     )
     
     scale_min: bpy.props.FloatProperty(name="Scale Min", default=0.8, min=0.01)
@@ -58,33 +39,40 @@ def draw_callback_px(self, context):
     if not self._path_points and not self._preview_dots:
         return
 
+    # Use 3D shader with proper matrix binding for Blender 4.0/5.x
     shader = gpu.shader.from_builtin('3D_UNIFORM_COLOR')
-    gpu.state.blend_set('ALPHA')
-    gpu.state.depth_test_set('NONE') # Make sure previews are visible on top of everything
     
-    # Path Line (RED)
+    gpu.state.blend_set('ALPHA')
+    gpu.state.depth_test_set('ALWAYS')
+    
+    # Get current matrices
+    rv3d = context.region_data
+    matrix = rv3d.perspective_matrix
+    
+    shader.bind()
+    shader.uniform_mat4("ModelViewProjectionMatrix", matrix)
+    
+    # Draw Path Line (RED)
     if len(self._path_points) > 1:
         gpu.state.line_width_set(4.0)
         batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": self._path_points})
-        shader.bind()
         shader.uniform_float("color", (1.0, 0.0, 0.0, 1.0))
         batch.draw(shader)
 
-    # Preview Dots (PURPLE)
+    # Draw Preview Dots (PURPLE)
     if self._preview_dots:
-        gpu.state.point_size_set(8.0)
+        gpu.state.point_size_set(10.0)
         batch_dots = batch_for_shader(shader, 'POINTS', {"pos": self._preview_dots})
-        shader.bind()
         shader.uniform_float("color", (0.7, 0.0, 1.0, 1.0))
         batch_dots.draw(shader)
     
-    gpu.state.depth_test_set('LESS') # Restore default
+    gpu.state.depth_test_set('LESS')
 
 # --- Operator ---
 class SCATTER_OT_brush(bpy.types.Operator):
-    """Scatter with base-alignment and auto-merge optimization"""
+    """Scatter objects and merge with chosen surface"""
     bl_idname = "object.scatter_brush"
-    bl_label = "Scatter Brush Pro"
+    bl_label = "Scatter Brush Surface Merge"
     bl_options = {'REGISTER', 'UNDO'}
 
     _handle = None
@@ -103,7 +91,7 @@ class SCATTER_OT_brush(bpy.types.Operator):
         if event.type == 'LEFTMOUSE':
             if event.value == 'PRESS':
                 if not props.target_surface or not props.source_obj:
-                    self.report({'WARNING'}, "Source and Target objects must be set")
+                    self.report({'WARNING'}, "Please set Source and Target objects")
                     return {'RUNNING_MODAL'}
                 self._painting = True
                 self._path_points = []
@@ -122,7 +110,6 @@ class SCATTER_OT_brush(bpy.types.Operator):
                 return {'RUNNING_MODAL'}
 
         elif event.type == 'MOUSEMOVE' and self._painting:
-            # Raycast logic
             coord = event.mouse_region_x, event.mouse_region_y
             region = context.region
             rv3d = context.region_data
@@ -161,39 +148,34 @@ class SCATTER_OT_brush(bpy.types.Operator):
         angle = random.uniform(0, 2 * math.pi)
         r = props.radius * math.sqrt(random.random())
         
-        # Calculate base offset to keep obj on surface
-        # We'll calculate the bounding box shift in execute_spawn, but here we just show the base loc
         dot_loc = center + (tangent * r * math.cos(angle)) + (bitangent * r * math.sin(angle))
         
         self._preview_dots.append(dot_loc)
         self._spawn_data.append((dot_loc, up))
 
     def execute_spawn(self, context, props):
-        # Calculate source object height offset (to sit on base)
         src = props.source_obj
-        # Find the lowest Z point in local space
+        target = props.target_surface
+        
+        # Calculate base offset (H/2 logic if origin at center, or min_z logic)
+        # Using min_z is more reliable.
         min_z = min((mathutils.Vector(b).z for b in src.bound_box))
         
         spawned_objects = []
         
         for loc, up in self._spawn_data:
             new_obj = src.copy()
-            new_obj.data = src.data.copy() # Independent copy to allow joining without affecting source
+            new_obj.data = src.data.copy()
             context.collection.objects.link(new_obj)
             
-            # Position alignment
-            new_obj.location = loc
-            
-            # Rotation alignment
+            # Rotation first to define local axes
             rot_quat = up.to_track_quat('Z', 'Y')
             new_obj.rotation_mode = 'QUATERNION'
             new_obj.rotation_quaternion = rot_quat
             
-            # Apply local Z offset so base touches surface
-            # Note: min_z is local. We need to shift along the local Z axis of the new object
-            # After track_quat, local Z is 'up'
+            # Position: Shift so base sits on surface
             shift = -min_z + props.offset
-            new_obj.location += up * shift
+            new_obj.location = loc + (up * shift)
             
             # Randomness
             rand_rot = random.uniform(0, props.random_rotation)
@@ -202,15 +184,20 @@ class SCATTER_OT_brush(bpy.types.Operator):
             
             spawned_objects.append(new_obj)
         
-        # Optimization: Join all into one object
-        if props.auto_join and len(spawned_objects) > 0:
-            # Deselect all
+        # Merge logic
+        if spawned_objects:
             bpy.ops.object.select_all(action='DESELECT')
             for obj in spawned_objects:
                 obj.select_set(True)
-            context.view_layer.objects.active = spawned_objects[0]
+            
+            if props.merge_with_surface:
+                target.select_set(True)
+                context.view_layer.objects.active = target
+            else:
+                context.view_layer.objects.active = spawned_objects[0]
+            
             bpy.ops.object.join()
-            context.active_object.name = f"Scatter_Result_{src.name}"
+            self.report({'INFO'}, "Successfully merged objects")
 
     def invoke(self, context, event):
         if context.space_data.type == 'VIEW_3D':
@@ -221,7 +208,7 @@ class SCATTER_OT_brush(bpy.types.Operator):
 
 # --- UI Panel ---
 class SCATTER_PT_panel(bpy.types.Panel):
-    bl_label = "Scatter Brush (Optimized)"
+    bl_label = "Scatter Brush Surface Merge"
     bl_idname = "SCATTER_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -239,8 +226,8 @@ class SCATTER_PT_panel(bpy.types.Panel):
         col = box.column(align=True)
         col.prop(props, "radius")
         col.prop(props, "density")
-        col.prop(props, "offset", text="Base Offset")
-        col.prop(props, "auto_join")
+        col.prop(props, "offset", text="Surface Offset")
+        col.prop(props, "merge_with_surface")
         
         box = layout.box()
         box.label(text="Randomness")
