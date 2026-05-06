@@ -239,7 +239,7 @@ class SCATTER_OT_brush(bpy.types.Operator):
         rv3d.view_perspective = 'ORTHO'
 
     # -----------------------------------------------------------------------
-    # Spawn  –  Linked Duplicate (giống Alt+D): real objects, shared mesh data
+    # Spawn  –  Geometry Nodes: Giống Array Modifier (1 khối, liên kết gốc)
     # -----------------------------------------------------------------------
     def _execute_spawn(self, context, props):
         src    = props.source_obj
@@ -248,53 +248,104 @@ class SCATTER_OT_brush(bpy.types.Operator):
         if not self._spawn_data:
             return
 
-        # Tìm đáy vật thể (điểm Z thấp nhất trong local space)
         bbox        = [mathutils.Vector(v) for v in src.bound_box]
         local_min_z = min(v.z for v in bbox)
 
-        # Empty container để gom nhóm trong Outliner
-        container = bpy.data.objects.new(f"Scatter_{src.name}", None)
-        container.empty_display_type = 'PLAIN_AXES'
-        container.empty_display_size = 0.1
-        context.collection.objects.link(container)
-        container.parent = target
-        container.matrix_parent_inverse = target.matrix_world.inverted()
+        coords    = []
+        rotations = []
+        scales    = []
 
         for loc, up in self._spawn_data:
-            # Linked Duplicate: giống Alt+D
-            # copy() sao chép Object nhưng DÙNG CHUNG mesh data với src
-            new_obj = src.copy()
-            context.collection.objects.link(new_obj)
+            scale_factor = random.uniform(props.scale_min, props.scale_max)
+            # Vì ta dùng ORIGINAL space trong GN, ta phải tự đưa scale của src vào đây
+            final_scale  = src.scale * scale_factor
 
-            # Hướng: Z-axis trùng với pháp tuyến mặt phẳng
+            # Đẩy lên để đáy vật thể chạm mặt phẳng
+            shift  = (-local_min_z * src.scale.z * scale_factor) + props.offset
+            coords.append(loc + up * shift)
+
+            # Tính toán góc xoay
             rot_q = up.to_track_quat('Z', 'Y')
             if props.random_rotation_3d:
                 for ax_i in range(3):
                     ax = [0, 0, 0]; ax[ax_i] = 1
-                    rot_q = rot_q @ mathutils.Quaternion(
-                        ax, math.radians(random.uniform(0, props.random_rotation)))
+                    rot_q = rot_q @ mathutils.Quaternion(ax, math.radians(random.uniform(0, props.random_rotation)))
             else:
-                rot_q = rot_q @ mathutils.Quaternion(
-                    (0, 0, 1), math.radians(random.uniform(0, props.random_rotation)))
+                rot_q = rot_q @ mathutils.Quaternion((0, 0, 1), math.radians(random.uniform(0, props.random_rotation)))
 
-            new_obj.rotation_mode       = 'QUATERNION'
-            new_obj.rotation_quaternion = rot_q
+            rotations.append(rot_q.to_euler())
+            scales.append(final_scale)
 
-            # Tỷ lệ ngẫu nhiên
-            scale_factor  = random.uniform(props.scale_min, props.scale_max)
-            new_obj.scale = src.scale * scale_factor
+        # 1. Tạo Mesh chứa các điểm
+        mesh = bpy.data.meshes.new("Scatter_Points")
+        obj  = bpy.data.objects.new(f"Scatter_{src.name}", mesh)
+        context.collection.objects.link(obj)
+        mesh.from_pydata(coords, [], [])
 
-            # Vị trí: đẩy lên để đáy vật thể chạm mặt phẳng
-            shift            = (-local_min_z * src.scale.z * scale_factor) + props.offset
-            new_obj.location = loc + up * shift
+        # 2. Lưu attributes để truyền vào GN
+        a_rot   = mesh.attributes.new("inst_rot",   'FLOAT_VECTOR', 'POINT')
+        a_scale = mesh.attributes.new("inst_scale", 'FLOAT_VECTOR', 'POINT')
+        for i, (r, s) in enumerate(zip(rotations, scales)):
+            a_rot.data[i].vector   = r
+            a_scale.data[i].vector = s
 
-            # Gom vào container, giữ nguyên world-space
-            new_obj.parent = container
-            new_obj.matrix_parent_inverse = container.matrix_world.inverted()
+        # 3. Gắn GN Modifier
+        mod            = obj.modifiers.new("Scatter_GN", 'NODES')
+        mod.node_group = self._build_gn_group(src)
 
+        # 4. Gắn parent vào Target
+        obj.parent = target
+        obj.matrix_parent_inverse = target.matrix_world.inverted()
+        
         bpy.ops.object.select_all(action='DESELECT')
-        container.select_set(True)
-        context.view_layer.objects.active = container
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+
+    def _build_gn_group(self, source_obj):
+        GN_NAME = f"ScatterGN_{source_obj.name}"
+        old = bpy.data.node_groups.get(GN_NAME)
+        if old:
+            bpy.data.node_groups.remove(old)
+
+        group = bpy.data.node_groups.new(GN_NAME, 'GeometryNodeTree')
+        group.interface.new_socket("Geometry", in_out='INPUT',  socket_type='NodeSocketGeometry')
+        group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+
+        nodes = group.nodes
+        links = group.links
+
+        def add(node_type, x, y):
+            n = nodes.new(node_type)
+            n.location = (x, y)
+            return n
+
+        n_in    = add('NodeGroupInput',  -600,  0)
+        n_out   = add('NodeGroupOutput',  600,  0)
+        n_inst  = add('GeometryNodeInstanceOnPoints', 200, 0)
+
+        n_obj   = add('GeometryNodeObjectInfo', -200, -150)
+        n_obj.inputs['Object'].default_value = source_obj
+        # QUAN TRỌNG: Phải dùng ORIGINAL để vật thể không bị văng ra xa
+        n_obj.transform_space = 'ORIGINAL'
+
+        n_rot   = add('GeometryNodeInputNamedAttribute', -200, 100)
+        n_rot.data_type = 'FLOAT_VECTOR'
+        n_rot.inputs['Name'].default_value = "inst_rot"
+
+        n_scl   = add('GeometryNodeInputNamedAttribute', -200, -50)
+        n_scl.data_type = 'FLOAT_VECTOR'
+        n_scl.inputs['Name'].default_value = "inst_scale"
+
+        n_euler = add('FunctionNodeEulerToRotation', 0, 100)
+
+        links.new(n_in.outputs['Geometry'],      n_inst.inputs['Points'])
+        links.new(n_obj.outputs['Geometry'],     n_inst.inputs['Instance'])
+        links.new(n_rot.outputs['Attribute'],    n_euler.inputs['Euler'])
+        links.new(n_euler.outputs['Rotation'],   n_inst.inputs['Rotation'])
+        links.new(n_scl.outputs['Attribute'],    n_inst.inputs['Scale'])
+        links.new(n_inst.outputs['Instances'],   n_out.inputs['Geometry'])
+
+        return group
 
 
 
