@@ -294,7 +294,9 @@ class SCATTER_OT_brush(bpy.types.Operator):
         mod.node_group = self._build_gn_group(src)
 
         # Organise: child of target surface
+        # IMPORTANT: set matrix_parent_inverse so world-space coords are preserved
         obj.parent = target
+        obj.matrix_parent_inverse = target.matrix_world.inverted()
         bpy.ops.object.select_all(action='DESELECT')
         obj.select_set(True)
         context.view_layer.objects.active = obj
