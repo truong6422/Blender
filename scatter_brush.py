@@ -35,50 +35,41 @@ def draw_callback_px(self, context):
     if not self._path_points and not self._preview_dots:
         return
 
-    # --- Robust 3D Drawing for Modern Blender ---
-    shader = gpu.shader.from_builtin('3D_UNIFORM_COLOR')
+    # --- Stable 2D Drawing in Screen Space (POST_PIXEL) ---
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    gpu.state.blend_set('ALPHA')
+    gpu.state.line_width_set(3.0)
     shader.bind()
 
-    # Use GPU matrix stack for absolute matrix accuracy
+    region = context.region
     rv3d = context.region_data
-    gpu.matrix.push_projection()
-    gpu.matrix.load_projection_matrix(rv3d.window_matrix)
-    gpu.matrix.push()
-    gpu.matrix.load_matrix(rv3d.view_matrix)
-    
-    mvp = gpu.matrix.get_projection_matrix() @ gpu.matrix.get_model_view_matrix()
-    try:
-        shader.uniform_mat4("ModelViewProjectionMatrix", mvp)
-    except:
-        pass
-
-    gpu.state.blend_set('ALPHA')
-    gpu.state.depth_test_set('ALWAYS')
-    gpu.state.depth_mask_set(False) # Don't write to depth buffer
 
     # Draw Path Line (RED)
     if len(self._path_points) > 1:
-        try: gpu.state.line_width_set(3.0)
-        except: pass
-        pos_list = [v[:] for v in self._path_points]
-        batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": pos_list})
-        shader.uniform_float("color", (1.0, 0.1, 0.1, 1.0))
-        batch.draw(shader)
+        points_2d = []
+        for p3d in self._path_points:
+            p2d = view3d_utils.location_3d_to_region_2d(region, rv3d, p3d)
+            if p2d: points_2d.append(p2d)
+        
+        if len(points_2d) > 1:
+            batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": points_2d})
+            shader.uniform_float("color", (1.0, 0.1, 0.1, 1.0))
+            batch.draw(shader)
 
     # Draw Preview Dots (PURPLE)
     if self._preview_dots:
-        try: gpu.state.point_size_set(10.0)
-        except: pass
-        pos_dots = [v[:] for v in self._preview_dots]
-        batch_dots = batch_for_shader(shader, 'POINTS', {"pos": pos_dots})
-        shader.uniform_float("color", (0.8, 0.0, 1.0, 1.0))
-        batch_dots.draw(shader)
+        dots_2d = []
+        for p3d in self._preview_dots:
+            p2d = view3d_utils.location_3d_to_region_2d(region, rv3d, p3d)
+            if p2d: dots_2d.append(p2d)
+        
+        if dots_2d:
+            batch_dots = batch_for_shader(shader, 'POINTS', {"pos": dots_2d})
+            shader.uniform_float("color", (0.8, 0.2, 1.0, 1.0))
+            try: gpu.state.point_size_set(10.0)
+            except: pass
+            batch_dots.draw(shader)
     
-    # Restore State
-    gpu.matrix.pop()
-    gpu.matrix.pop_projection()
-    gpu.state.depth_mask_set(True)
-    gpu.state.depth_test_set('LESS')
     gpu.state.blend_set('NONE')
 
 # --- Operator ---
@@ -248,18 +239,30 @@ class SCATTER_OT_brush(bpy.types.Operator):
             spawned_objects.append(new_obj)
         
         if spawned_objects:
-            bpy.ops.object.select_all(action='DESELECT')
-            for obj in spawned_objects: obj.select_set(True)
+            # Create a container empty to keep things organized in the Outliner
+            container = bpy.data.objects.new("Scatter_Result", None)
+            context.collection.objects.link(container)
+            container.location = target.location
             
-            # If merging, we lose instancing because it becomes one mesh
-            if props.merge_with_surface and not props.use_instances:
-                target.select_set(True)
-                context.view_layer.objects.active = target
-                bpy.ops.object.join()
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in spawned_objects: 
+                obj.select_set(True)
+                obj.parent = container # Keeps them linked but "together"
+            
+            if props.merge_with_surface:
+                if props.use_instances:
+                    # Can't join without breaking instances, so we parent to target instead
+                    container.parent = target
+                    self.report({'INFO'}, "Parented to target to preserve Instances")
+                else:
+                    # Deep copy mode: we can join everything into one mesh
+                    target.select_set(True)
+                    context.view_layer.objects.active = target
+                    bpy.ops.object.join()
+                    # Delete the empty if joined
+                    bpy.data.objects.remove(container, do_unlink=True)
             else:
-                context.view_layer.objects.active = spawned_objects[0]
-                if props.merge_with_surface and props.use_instances:
-                    self.report({'INFO'}, "Bỏ qua Merge vì đang dùng Instances (để giữ liên kết)")
+                context.view_layer.objects.active = container
 
     def invoke(self, context, event):
         if context.space_data.type == 'VIEW_3D':
@@ -271,7 +274,8 @@ class SCATTER_OT_brush(bpy.types.Operator):
             # Align view to target surface normal
             self.align_view_to_target(context, props.target_surface)
 
-            self._handle = bpy.types.SpaceView3D.draw_handler_add(draw_callback_px, (self, context), 'WINDOW', 'POST_VIEW')
+            # Use POST_PIXEL for screen-space drawing (much more stable)
+            self._handle = bpy.types.SpaceView3D.draw_handler_add(draw_callback_px, (self, context), 'WINDOW', 'POST_PIXEL')
             context.window_manager.modal_handler_add(self)
             return {'RUNNING_MODAL'}
         return {'CANCELLED'}
