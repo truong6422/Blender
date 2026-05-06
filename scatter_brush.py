@@ -301,13 +301,13 @@ class SCATTER_OT_brush(bpy.types.Operator):
 
     def _build_gn_group(self, source_obj):
         """
-        Build (or reuse) a Geometry Nodes group that instances source_obj
-        on every point, honouring per-point rotation and scale attributes.
+        Always build a fresh GN group (avoids reusing a broken cached group).
         """
         GN_NAME = f"ScatterGN_{source_obj.name}"
-        group   = bpy.data.node_groups.get(GN_NAME)
-        if group:
-            return group
+        # Remove stale group if exists
+        old = bpy.data.node_groups.get(GN_NAME)
+        if old:
+            bpy.data.node_groups.remove(old)
 
         group = bpy.data.node_groups.new(GN_NAME, 'GeometryNodeTree')
 
@@ -348,18 +348,17 @@ class SCATTER_OT_brush(bpy.types.Operator):
         # Euler to Rotation (needed because Instance on Points expects Rotation socket)
         n_euler = add('FunctionNodeEulerToRotation', 0, 100)
 
-        # Combine XYZ for scale
-        n_cxyz  = add('ShaderNodeCombineXYZ', 0, -50)
-
-        # Wire it all up
+        # --- Wire it all up ---
+        # Points from group input
         links.new(n_in.outputs['Geometry'],      n_inst.inputs['Points'])
+        # Instance geometry from object info
         links.new(n_obj.outputs['Geometry'],     n_inst.inputs['Instance'])
+        # Rotation: Named Attr (Vector) → EulerToRotation → Instance on Points
         links.new(n_rot.outputs['Attribute'],    n_euler.inputs['Euler'])
         links.new(n_euler.outputs['Rotation'],   n_inst.inputs['Rotation'])
-        links.new(n_scl.outputs['Attribute'],    n_cxyz.inputs['X'])
-        links.new(n_scl.outputs['Attribute'],    n_cxyz.inputs['Y'])
-        links.new(n_scl.outputs['Attribute'],    n_cxyz.inputs['Z'])
-        links.new(n_cxyz.outputs['Vector'],      n_inst.inputs['Scale'])
+        # Scale: Named Attr (Vector) → directly into Scale socket (accepts Vector)
+        links.new(n_scl.outputs['Attribute'],    n_inst.inputs['Scale'])
+        # Output
         links.new(n_inst.outputs['Instances'],   n_out.inputs['Geometry'])
 
         return group
