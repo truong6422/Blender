@@ -239,131 +239,63 @@ class SCATTER_OT_brush(bpy.types.Operator):
         rv3d.view_perspective = 'ORTHO'
 
     # -----------------------------------------------------------------------
-    # Spawn  –  creates one Geometry Nodes object per stroke
+    # Spawn  –  Linked Duplicate (giống Alt+D): real objects, shared mesh data
     # -----------------------------------------------------------------------
     def _execute_spawn(self, context, props):
         src    = props.source_obj
         target = props.target_surface
 
-        # Bounding box → find bottom of object in local space
-        bbox      = [mathutils.Vector(v) for v in src.bound_box]
+        if not self._spawn_data:
+            return
+
+        # Tìm đáy vật thể (điểm Z thấp nhất trong local space)
+        bbox        = [mathutils.Vector(v) for v in src.bound_box]
         local_min_z = min(v.z for v in bbox)
 
-        coords    = []
-        rotations = []
-        scales    = []
+        # Empty container để gom nhóm trong Outliner
+        container = bpy.data.objects.new(f"Scatter_{src.name}", None)
+        container.empty_display_type = 'PLAIN_AXES'
+        container.empty_display_size = 0.1
+        context.collection.objects.link(container)
+        container.parent = target
+        container.matrix_parent_inverse = target.matrix_world.inverted()
 
         for loc, up in self._spawn_data:
-            # Scale
-            scale_factor = random.uniform(props.scale_min, props.scale_max)
-            final_scale  = src.scale * scale_factor
+            # Linked Duplicate: giống Alt+D
+            # copy() sao chép Object nhưng DÙNG CHUNG mesh data với src
+            new_obj = src.copy()
+            context.collection.objects.link(new_obj)
 
-            # Height offset so object bottom sits on surface
-            shift  = (-local_min_z * src.scale.z * scale_factor) + props.offset
-            coords.append(loc + up * shift)
-
-            # Rotation – align Z to surface normal then randomise
+            # Hướng: Z-axis trùng với pháp tuyến mặt phẳng
             rot_q = up.to_track_quat('Z', 'Y')
             if props.random_rotation_3d:
                 for ax_i in range(3):
                     ax = [0, 0, 0]; ax[ax_i] = 1
-                    rot_q = rot_q @ mathutils.Quaternion(ax, math.radians(
-                        random.uniform(0, props.random_rotation)))
+                    rot_q = rot_q @ mathutils.Quaternion(
+                        ax, math.radians(random.uniform(0, props.random_rotation)))
             else:
                 rot_q = rot_q @ mathutils.Quaternion(
                     (0, 0, 1), math.radians(random.uniform(0, props.random_rotation)))
 
-            rotations.append(rot_q.to_euler())
-            scales.append(final_scale)
+            new_obj.rotation_mode       = 'QUATERNION'
+            new_obj.rotation_quaternion = rot_q
 
-        # Build a mesh of points
-        mesh = bpy.data.meshes.new("Scatter_Points")
-        obj  = bpy.data.objects.new("Scatter_Instance", mesh)
-        context.collection.objects.link(obj)
-        mesh.from_pydata(coords, [], [])
+            # Tỷ lệ ngẫu nhiên
+            scale_factor  = random.uniform(props.scale_min, props.scale_max)
+            new_obj.scale = src.scale * scale_factor
 
-        # Store per-point attributes
-        a_rot   = mesh.attributes.new("inst_rot",   'FLOAT_VECTOR', 'POINT')
-        a_scale = mesh.attributes.new("inst_scale", 'FLOAT_VECTOR', 'POINT')
-        for i, (r, s) in enumerate(zip(rotations, scales)):
-            a_rot.data[i].vector   = r
-            a_scale.data[i].vector = s
+            # Vị trí: đẩy lên để đáy vật thể chạm mặt phẳng
+            shift            = (-local_min_z * src.scale.z * scale_factor) + props.offset
+            new_obj.location = loc + up * shift
 
-        # Apply Geometry Nodes modifier
-        mod            = obj.modifiers.new("Scatter_GN", 'NODES')
-        mod.node_group = self._build_gn_group(src)
+            # Gom vào container, giữ nguyên world-space
+            new_obj.parent = container
+            new_obj.matrix_parent_inverse = container.matrix_world.inverted()
 
-        # Organise: child of target surface
-        # IMPORTANT: set matrix_parent_inverse so world-space coords are preserved
-        obj.parent = target
-        obj.matrix_parent_inverse = target.matrix_world.inverted()
         bpy.ops.object.select_all(action='DESELECT')
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
+        container.select_set(True)
+        context.view_layer.objects.active = container
 
-    def _build_gn_group(self, source_obj):
-        """
-        Always build a fresh GN group (avoids reusing a broken cached group).
-        """
-        GN_NAME = f"ScatterGN_{source_obj.name}"
-        # Remove stale group if exists
-        old = bpy.data.node_groups.get(GN_NAME)
-        if old:
-            bpy.data.node_groups.remove(old)
-
-        group = bpy.data.node_groups.new(GN_NAME, 'GeometryNodeTree')
-
-        # --- Interface (Blender 4.x API) ---
-        group.interface.new_socket("Geometry", in_out='INPUT',  socket_type='NodeSocketGeometry')
-        group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
-
-        nodes = group.nodes
-        links = group.links
-
-        # Utility to place nodes neatly
-        def add(node_type, x, y):
-            n = nodes.new(node_type)
-            n.location = (x, y)
-            return n
-
-        n_in    = add('NodeGroupInput',  -600,  0)
-        n_out   = add('NodeGroupOutput',  600,  0)
-
-        # Instance on Points
-        n_inst  = add('GeometryNodeInstanceOnPoints', 200, 0)
-
-        # Object Info for source_obj
-        n_obj   = add('GeometryNodeObjectInfo', -200, -150)
-        n_obj.inputs['Object'].default_value = source_obj
-        n_obj.transform_space = 'RELATIVE'
-
-        # Named Attribute – rotation
-        n_rot   = add('GeometryNodeInputNamedAttribute', -200, 100)
-        n_rot.data_type = 'FLOAT_VECTOR'
-        n_rot.inputs['Name'].default_value = "inst_rot"
-
-        # Named Attribute – scale
-        n_scl   = add('GeometryNodeInputNamedAttribute', -200, -50)
-        n_scl.data_type = 'FLOAT_VECTOR'
-        n_scl.inputs['Name'].default_value = "inst_scale"
-
-        # Euler to Rotation (needed because Instance on Points expects Rotation socket)
-        n_euler = add('FunctionNodeEulerToRotation', 0, 100)
-
-        # --- Wire it all up ---
-        # Points from group input
-        links.new(n_in.outputs['Geometry'],      n_inst.inputs['Points'])
-        # Instance geometry from object info
-        links.new(n_obj.outputs['Geometry'],     n_inst.inputs['Instance'])
-        # Rotation: Named Attr (Vector) → EulerToRotation → Instance on Points
-        links.new(n_rot.outputs['Attribute'],    n_euler.inputs['Euler'])
-        links.new(n_euler.outputs['Rotation'],   n_inst.inputs['Rotation'])
-        # Scale: Named Attr (Vector) → directly into Scale socket (accepts Vector)
-        links.new(n_scl.outputs['Attribute'],    n_inst.inputs['Scale'])
-        # Output
-        links.new(n_inst.outputs['Instances'],   n_out.inputs['Geometry'])
-
-        return group
 
 
 # ---------------------------------------------------------------------------
