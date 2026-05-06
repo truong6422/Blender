@@ -28,47 +28,58 @@ class ScatterProperties(bpy.types.PropertyGroup):
     scale_max: bpy.props.FloatProperty(name="Scale Max", default=1.2, min=0.01)
     random_rotation: bpy.props.FloatProperty(name="Rand Rotation", default=360.0, min=0.0, subtype='ANGLE')
     random_rotation_3d: bpy.props.BoolProperty(name="3D Random Rotation", default=False)
+    use_instances: bpy.props.BoolProperty(name="Use Instances (Link Data)", default=True, description="Vật thể sẽ tự cập nhật khi bạn sửa bản gốc")
 
 # --- Global Draw Handler ---
 def draw_callback_px(self, context):
     if not self._path_points and not self._preview_dots:
         return
 
-    # Use a more robust shader approach for 4.x/5.x
+    # --- Robust 3D Drawing for Modern Blender ---
     shader = gpu.shader.from_builtin('3D_UNIFORM_COLOR')
-    gpu.state.blend_set('ALPHA')
-    gpu.state.depth_test_set('ALWAYS') # Always on top
-    
-    # In modern Blender, we can use the matrix stack
-    # Or manually bind the MVP matrix
-    rv3d = context.region_data
-    view_matrix = rv3d.view_matrix
-    projection_matrix = rv3d.perspective_matrix
-    
     shader.bind()
+
+    # Use GPU matrix stack for absolute matrix accuracy
+    rv3d = context.region_data
+    gpu.matrix.push_projection()
+    gpu.matrix.load_projection_matrix(rv3d.window_matrix)
+    gpu.matrix.push()
+    gpu.matrix.load_matrix(rv3d.view_matrix)
+    
+    mvp = gpu.matrix.get_projection_matrix() @ gpu.matrix.get_model_view_matrix()
     try:
-        shader.uniform_mat4("ModelViewProjectionMatrix", context.region_data.perspective_matrix)
+        shader.uniform_mat4("ModelViewProjectionMatrix", mvp)
     except:
         pass
-    
+
+    gpu.state.blend_set('ALPHA')
+    gpu.state.depth_test_set('ALWAYS')
+    gpu.state.depth_mask_set(False) # Don't write to depth buffer
+
     # Draw Path Line (RED)
     if len(self._path_points) > 1:
-        try: gpu.state.line_width_set(4.0)
+        try: gpu.state.line_width_set(3.0)
         except: pass
-        # Offset points slightly towards camera to avoid z-fighting even with ALWAYS
-        batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": self._path_points})
-        shader.uniform_float("color", (1.0, 0.0, 0.0, 1.0))
+        pos_list = [v[:] for v in self._path_points]
+        batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": pos_list})
+        shader.uniform_float("color", (1.0, 0.1, 0.1, 1.0))
         batch.draw(shader)
 
     # Draw Preview Dots (PURPLE)
     if self._preview_dots:
         try: gpu.state.point_size_set(10.0)
         except: pass
-        batch_dots = batch_for_shader(shader, 'POINTS', {"pos": self._preview_dots})
-        shader.uniform_float("color", (0.7, 0.0, 1.0, 1.0))
+        pos_dots = [v[:] for v in self._preview_dots]
+        batch_dots = batch_for_shader(shader, 'POINTS', {"pos": pos_dots})
+        shader.uniform_float("color", (0.8, 0.0, 1.0, 1.0))
         batch_dots.draw(shader)
     
+    # Restore State
+    gpu.matrix.pop()
+    gpu.matrix.pop_projection()
+    gpu.state.depth_mask_set(True)
     gpu.state.depth_test_set('LESS')
+    gpu.state.blend_set('NONE')
 
 # --- Operator ---
 class SCATTER_OT_brush(bpy.types.Operator):
@@ -85,8 +96,8 @@ class SCATTER_OT_brush(bpy.types.Operator):
     _painting = False
 
     def modal(self, context, event):
-        if context.area:
-            context.area.tag_redraw()
+        if context.region:
+            context.region.tag_redraw()
             
         props = context.scene.scatter_props
         
@@ -122,9 +133,9 @@ class SCATTER_OT_brush(bpy.types.Operator):
             
             if hit:
                 # Offset preview slightly to avoid Z-fighting
-                preview_loc = location + normal * 0.01
+                preview_loc = location + normal * 0.02
                 
-                if not self._path_points or (location - self._path_points[-1]).length > 0.05:
+                if not self._path_points or (location - self._path_points[-1]).length > 0.01:
                     self._path_points.append(preview_loc.copy())
 
                 if self._last_path_pos is None or (location - self._last_path_pos).length >= props.density:
@@ -197,7 +208,11 @@ class SCATTER_OT_brush(bpy.types.Operator):
         
         for loc, up in self._spawn_data:
             new_obj = src.copy()
-            new_obj.data = src.data.copy()
+            if not props.use_instances:
+                # Deep copy mesh data
+                new_obj.data = src.data.copy()
+            # If use_instances is True, we keep new_obj.data = src.data (Linked Data)
+            
             context.collection.objects.link(new_obj)
             
             # Initial orientation
@@ -235,12 +250,16 @@ class SCATTER_OT_brush(bpy.types.Operator):
         if spawned_objects:
             bpy.ops.object.select_all(action='DESELECT')
             for obj in spawned_objects: obj.select_set(True)
-            if props.merge_with_surface:
+            
+            # If merging, we lose instancing because it becomes one mesh
+            if props.merge_with_surface and not props.use_instances:
                 target.select_set(True)
                 context.view_layer.objects.active = target
+                bpy.ops.object.join()
             else:
                 context.view_layer.objects.active = spawned_objects[0]
-            bpy.ops.object.join()
+                if props.merge_with_surface and props.use_instances:
+                    self.report({'INFO'}, "Bỏ qua Merge vì đang dùng Instances (để giữ liên kết)")
 
     def invoke(self, context, event):
         if context.space_data.type == 'VIEW_3D':
@@ -299,6 +318,7 @@ class SCATTER_PT_panel(bpy.types.Panel):
         col.prop(props, "scale_max")
         col.prop(props, "random_rotation")
         col.prop(props, "random_rotation_3d")
+        col.prop(props, "use_instances")
         layout.separator()
         layout.operator("object.scatter_brush", text="Paint & Merge", icon='BRUSH_DATA')
 
