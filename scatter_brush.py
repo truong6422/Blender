@@ -322,6 +322,9 @@ class SCATTER_OT_brush(bpy.types.Operator):
         n_in    = add('NodeGroupInput',  -600,  0)
         n_out   = add('NodeGroupOutput',  600,  0)
         n_inst  = add('GeometryNodeInstanceOnPoints', 200, 0)
+        
+        # Thêm node Realize Instances để Blender cho phép Apply modifier thành Mesh thật
+        n_realize = add('GeometryNodeRealizeInstances', 400, 0)
 
         n_obj   = add('GeometryNodeObjectInfo', -200, -150)
         n_obj.inputs['Object'].default_value = source_obj
@@ -343,7 +346,10 @@ class SCATTER_OT_brush(bpy.types.Operator):
         links.new(n_rot.outputs['Attribute'],    n_euler.inputs['Euler'])
         links.new(n_euler.outputs['Rotation'],   n_inst.inputs['Rotation'])
         links.new(n_scl.outputs['Attribute'],    n_inst.inputs['Scale'])
-        links.new(n_inst.outputs['Instances'],   n_out.inputs['Geometry'])
+        
+        # Nối Instance qua Realize Instances trước khi ra Output
+        links.new(n_inst.outputs['Instances'],   n_realize.inputs[0])
+        links.new(n_realize.outputs[0],          n_out.inputs['Geometry'])
 
         return group
 
