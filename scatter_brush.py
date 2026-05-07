@@ -7,10 +7,10 @@ from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
 bl_info = {
-    "name": "Scatter Brush",
+    "name": "Scatter Brush Pro",
     "author": "Truong",
-    "version": (2, 0),
-    "blender": (4, 0, 0),
+    "version": (1, 0, 0),
+    "blender": (5, 1, 1),
     "location": "View3D > Sidebar > Scatter Tab",
     "description": "Scatter objects onto a surface with GPU preview and Geometry Nodes instancing",
     "category": "Object",
