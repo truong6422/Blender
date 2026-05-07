@@ -94,7 +94,7 @@ def draw_callback_px(self, context):
 class SCATTER_OT_brush(bpy.types.Operator):
     """Paint-scatter objects onto a surface (Enter / Esc / click outside to finish)"""
     bl_idname = "object.scatter_brush"
-    bl_label  = "Scatter Brush Pro v2"
+    bl_label  = "Scatter Brush Pro"
     bl_options = {'REGISTER', 'UNDO'}
 
     # ---- instance state (NOT class-level lists – those are shared!) --------
@@ -359,7 +359,7 @@ class SCATTER_OT_brush(bpy.types.Operator):
 # UI Panel
 # ---------------------------------------------------------------------------
 class SCATTER_PT_panel(bpy.types.Panel):
-    bl_label      = "Scatter Brush Pro v2"
+    bl_label      = "Scatter Brush Pro"
     bl_idname     = "SCATTER_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type= 'UI'
